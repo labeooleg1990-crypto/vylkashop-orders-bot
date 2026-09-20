@@ -10,25 +10,37 @@ app = Flask(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-# Поки ID групи менеджерів невідомий, змінна може бути порожньою.
-MANAGER_CHAT_ID = os.environ.get("MANAGER_CHAT_ID", "")
+MANAGER_CHAT_ID = os.environ.get(
+    "MANAGER_CHAT_ID",
+    "-1004323796567"
+)
 
-# Канал магазину
 SHOP_CHANNEL = "@vylkashop"
 
-# Адреса нашого сервісу Render
 RENDER_URL = "https://vylkashop-orders-bot.onrender.com"
 
-# Telegram Bot API
 BOT_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-
-# Запам'ятовуємо, який товар обрав покупець.
-# Для тестової версії цього достатньо.
-customer_products = {}
 
 
 # =========================================================
-# ФУНКЦІЇ TELEGRAM
+# ТИМЧАСОВЕ СХОВИЩЕ
+# =========================================================
+
+# Який товар зараз вибрав покупець
+customer_products = {}
+
+# customer_id -> topic_id
+customer_topics = {}
+
+# topic_id -> customer_id
+topic_customers = {}
+
+# Запам'ятовуємо, чи вже показували товар менеджеру
+product_sent_to_topic = {}
+
+
+# =========================================================
+# TELEGRAM API
 # =========================================================
 
 def telegram(method, data):
@@ -46,6 +58,7 @@ def telegram(method, data):
         return result
 
     except Exception as error:
+
         print(f"Telegram API error: {error}")
 
         return {
@@ -54,15 +67,19 @@ def telegram(method, data):
         }
 
 
-def send_message(chat_id, text, reply_markup=None):
+def send_message(
+    chat_id,
+    text,
+    message_thread_id=None
+):
 
     data = {
         "chat_id": chat_id,
         "text": text
     }
 
-    if reply_markup:
-        data["reply_markup"] = reply_markup
+    if message_thread_id:
+        data["message_thread_id"] = message_thread_id
 
     return telegram(
         "sendMessage",
@@ -70,24 +87,85 @@ def send_message(chat_id, text, reply_markup=None):
     )
 
 
-def copy_product(to_chat_id, message_id):
-    """
-    Копіює оригінальний товарний пост
-    із Telegram-каналу VYLKA.SHOP.
-    """
+def copy_message(
+    to_chat_id,
+    from_chat_id,
+    message_id,
+    message_thread_id=None
+):
+
+    data = {
+        "chat_id": to_chat_id,
+        "from_chat_id": from_chat_id,
+        "message_id": message_id
+    }
+
+    if message_thread_id:
+        data["message_thread_id"] = message_thread_id
 
     return telegram(
         "copyMessage",
-        {
-            "chat_id": to_chat_id,
-            "from_chat_id": SHOP_CHANNEL,
-            "message_id": message_id
-        }
+        data
+    )
+
+
+def copy_product(
+    to_chat_id,
+    post_id,
+    message_thread_id=None
+):
+
+    return copy_message(
+        to_chat_id,
+        SHOP_CHANNEL,
+        post_id,
+        message_thread_id
     )
 
 
 # =========================================================
-# ПЕРЕВІРКА RENDER
+# СТВОРЕННЯ ГІЛКИ ПОКУПЦЯ
+# =========================================================
+
+def create_customer_topic(customer_id, customer_name):
+
+    # Якщо для цього покупця вже є гілка
+    if customer_id in customer_topics:
+        return customer_topics[customer_id]
+
+    # Назва гілки
+    topic_name = f"👤 {customer_name}"
+
+    # Telegram має обмеження на довжину назви
+    topic_name = topic_name[:120]
+
+    result = telegram(
+        "createForumTopic",
+        {
+            "chat_id": MANAGER_CHAT_ID,
+            "name": topic_name
+        }
+    )
+
+    if not result.get("ok"):
+
+        print(
+            "Не вдалося створити гілку:",
+            result
+        )
+
+        return None
+
+    topic_id = result["result"]["message_thread_id"]
+
+    customer_topics[customer_id] = topic_id
+    topic_customers[topic_id] = customer_id
+
+    return topic_id
+
+
+# =========================================================
+# ГОЛОВНА СТОРІНКА
 # =========================================================
 
 @app.route("/", methods=["GET"])
@@ -97,7 +175,7 @@ def home():
 
 
 # =========================================================
-# НАЛАШТУВАННЯ TELEGRAM WEBHOOK
+# WEBHOOK SETUP
 # =========================================================
 
 @app.route("/setup-webhook", methods=["GET"])
@@ -108,7 +186,10 @@ def setup_webhook():
     result = telegram(
         "setWebhook",
         {
-            "url": webhook_url
+            "url": webhook_url,
+            "allowed_updates": [
+                "message"
+            ]
         }
     )
 
@@ -116,7 +197,7 @@ def setup_webhook():
 
 
 # =========================================================
-# TELEGRAM WEBHOOK
+# WEBHOOK
 # =========================================================
 
 @app.route("/webhook", methods=["POST"])
@@ -128,9 +209,19 @@ def webhook():
 
     message = update.get("message")
 
-    # Поки що обробляємо звичайні повідомлення.
     if not message:
         return "OK", 200
+
+
+    # =====================================================
+    # НЕ ОБРОБЛЯЄМО ВЛАСНІ ПОВІДОМЛЕННЯ БОТА
+    # =====================================================
+
+    sender = message.get("from", {})
+
+    if sender.get("is_bot"):
+        return "OK", 200
+
 
     chat = message.get("chat", {})
 
@@ -144,7 +235,7 @@ def webhook():
 
 
     # =====================================================
-    # КОМАНДА /chatid
+    # /chatid
     # =====================================================
 
     if text.startswith("/chatid"):
@@ -158,28 +249,34 @@ def webhook():
 
 
     # =====================================================
-    # ПРИВАТНИЙ ЧАТ ПОКУПЦЯ З БОТОМ
+    # ПРИВАТНИЙ ЧАТ ПОКУПЦЯ
     # =====================================================
 
     if chat_type == "private":
 
-        # -------------------------------------------------
-        # ПОКУПЕЦЬ ПЕРЕЙШОВ ІЗ КНОПКИ ТОВАРУ
-        #
-        # Наприклад:
-        #
-        # https://t.me/vylkashop_orders_bot?start=post_7
-        #
-        # Telegram передасть боту:
-        #
-        # /start post_7
-        # -------------------------------------------------
+        customer_id = chat_id
+
+        first_name = sender.get(
+            "first_name",
+            "Покупець"
+        )
+
+        username = sender.get("username")
+
+        customer_name = first_name
+
+        if username:
+            customer_name += f" @{username}"
+
+
+        # =================================================
+        # START ІЗ КОНКРЕТНОГО ТОВАРУ
+        # =================================================
 
         if text.startswith("/start"):
 
             parts = text.split(maxsplit=1)
 
-            # Перевіряємо, чи є параметр після /start
             if len(parts) == 2:
 
                 parameter = parts[1]
@@ -203,19 +300,21 @@ def webhook():
 
                     if post_id:
 
-                        # Запам'ятовуємо вибраний товар
-                        customer_products[chat_id] = post_id
+                        # Запам'ятовуємо товар
+                        customer_products[
+                            customer_id
+                        ] = post_id
 
-                        # Копіюємо сам товар покупцеві
-                        copy_result = copy_product(
-                            chat_id,
+                        # Показуємо покупцю товар
+                        result = copy_product(
+                            customer_id,
                             post_id
                         )
 
-                        if copy_result.get("ok"):
+                        if result.get("ok"):
 
                             send_message(
-                                chat_id,
+                                customer_id,
                                 "👋 Ви обрали цей товар.\n\n"
                                 "Напишіть ваше запитання "
                                 "або повідомлення для менеджера."
@@ -224,22 +323,21 @@ def webhook():
                         else:
 
                             send_message(
-                                chat_id,
+                                customer_id,
                                 "⚠️ Не вдалося показати товар.\n\n"
-                                "Будь ласка, напишіть менеджеру."
+                                "Напишіть повідомлення менеджеру."
                             )
 
                         return "OK", 200
 
 
-            # Якщо користувач просто натиснув START
-            # без конкретного товару
+            # START без товару
 
             send_message(
-                chat_id,
+                customer_id,
                 "👋 Вітаємо у VYLKA.SHOP!\n\n"
                 "Оберіть потрібний товар у нашому "
-                "Telegram-каналі та натисніть кнопку "
+                "Telegram-каналі та натисніть "
                 "«🛒 Запитати / Замовити»."
             )
 
@@ -247,94 +345,95 @@ def webhook():
 
 
         # =================================================
-        # ПОКУПЕЦЬ НАПИСАВ ПОВІДОМЛЕННЯ
+        # ПОВІДОМЛЕННЯ ПОКУПЦЯ
         # =================================================
 
-        post_id = customer_products.get(chat_id)
-
-        user = message.get("from", {})
-
-        first_name = user.get(
-            "first_name",
-            "Покупець"
+        post_id = customer_products.get(
+            customer_id
         )
 
-        username = user.get("username")
 
-        customer_name = first_name
+        # Створюємо або знаходимо гілку покупця
 
-        if username:
-            customer_name += f" (@{username})"
+        topic_id = create_customer_topic(
+            customer_id,
+            customer_name
+        )
 
 
         # =================================================
-        # ЯКЩО ГРУПА МЕНЕДЖЕРІВ ЩЕ НЕ НАЛАШТОВАНА
+        # ЯКЩО ГІЛКУ НЕ ВДАЛОСЯ СТВОРИТИ
         # =================================================
 
-        if not MANAGER_CHAT_ID:
+        if not topic_id:
 
             send_message(
-                chat_id,
-                "Дякуємо за повідомлення.\n\n"
-                "Система зв'язку з менеджером "
-                "зараз налаштовується."
+                customer_id,
+                "⚠️ Не вдалося передати повідомлення "
+                "менеджеру.\n\n"
+                "Спробуйте ще раз трохи пізніше."
             )
 
             return "OK", 200
 
 
         # =================================================
-        # КОПІЮЄМО ТОВАР У ГРУПУ МЕНЕДЖЕРІВ
+        # ПЕРШЕ ПОВІДОМЛЕННЯ У ГІЛЦІ
         # =================================================
 
-        if post_id:
+        if customer_id not in product_sent_to_topic:
 
-            copy_product(
+            # Інформація про покупця
+
+            info = (
+                "🛍 НОВЕ ЗВЕРНЕННЯ\n\n"
+                f"👤 Покупець: {customer_name}\n"
+                f"🆔 Telegram ID: {customer_id}"
+            )
+
+            send_message(
                 MANAGER_CHAT_ID,
-                post_id
+                info,
+                topic_id
             )
 
 
-        # =================================================
-        # ФОРМУЄМО ПОВІДОМЛЕННЯ ДЛЯ МЕНЕДЖЕРА
-        # =================================================
+            # Сам товар
 
-        manager_text = (
-            "🛍 НОВЕ ЗВЕРНЕННЯ\n\n"
-            f"👤 Покупець: {customer_name}\n"
-            f"🆔 Telegram ID: {chat_id}\n"
-        )
+            if post_id:
 
-        if post_id:
+                copy_product(
+                    MANAGER_CHAT_ID,
+                    post_id,
+                    topic_id
+                )
 
-            manager_text += (
-                f"📦 Товар: пост №{post_id}\n"
-            )
 
-        manager_text += (
-            "\n💬 Повідомлення покупця:\n"
-        )
-
-        if text:
-
-            manager_text += text
-
-        else:
-
-            manager_text += (
-                "[Покупець надіслав медіа "
-                "або інший тип повідомлення]"
-            )
+            product_sent_to_topic[
+                customer_id
+            ] = True
 
 
         # =================================================
-        # НАДСИЛАЄМО ЗВЕРНЕННЯ МЕНЕДЖЕРУ
+        # КОПІЮЄМО ПОВІДОМЛЕННЯ ПОКУПЦЯ
         # =================================================
 
-        send_message(
+        copy_result = copy_message(
             MANAGER_CHAT_ID,
-            manager_text
+            customer_id,
+            message["message_id"],
+            topic_id
         )
+
+
+        # Якщо copyMessage не спрацював
+        if not copy_result.get("ok") and text:
+
+            send_message(
+                MANAGER_CHAT_ID,
+                f"💬 {text}",
+                topic_id
+            )
 
 
         # =================================================
@@ -342,22 +441,70 @@ def webhook():
         # =================================================
 
         send_message(
-            chat_id,
-            "✅ Ваше повідомлення передано менеджеру."
+            customer_id,
+            "✅ Повідомлення передано менеджеру."
         )
 
         return "OK", 200
 
 
     # =====================================================
-    # ІНШІ ПОВІДОМЛЕННЯ
+    # ГРУПА МЕНЕДЖЕРІВ
     # =====================================================
+
+    if str(chat_id) == str(MANAGER_CHAT_ID):
+
+        # ID гілки, з якої пише менеджер
+        topic_id = message.get(
+            "message_thread_id"
+        )
+
+        # Якщо повідомлення написане не в гілці
+        if not topic_id:
+            return "OK", 200
+
+
+        # Знаходимо покупця
+        customer_id = topic_customers.get(
+            topic_id
+        )
+
+
+        # Якщо ця гілка не пов'язана з покупцем
+        if not customer_id:
+            return "OK", 200
+
+
+        # =================================================
+        # ПЕРЕДАЄМО ПОВІДОМЛЕННЯ МЕНЕДЖЕРА ПОКУПЦЮ
+        # =================================================
+
+        result = copy_message(
+            customer_id,
+            MANAGER_CHAT_ID,
+            message["message_id"]
+        )
+
+
+        # Якщо копіювання не вдалося,
+        # пробуємо передати текст
+
+        if not result.get("ok") and text:
+
+            send_message(
+                customer_id,
+                f"💬 Менеджер VYLKA.SHOP:\n\n{text}"
+            )
+
+
+        return "OK", 200
+
 
     return "OK", 200
 
 
 # =========================================================
-# ЗАПУСК FLASK
+# ЗАПУСК
 # =========================================================
 
 if __name__ == "__main__":
