@@ -13,8 +13,10 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 MANAGER_CHAT_ID = os.environ["MANAGER_CHAT_ID"]
 DATABASE_URL = os.environ["DATABASE_URL"]
+ADMIN_USER_ID = int(os.environ["ADMIN_USER_ID"])
 
 SHOP_CHANNEL = "@vylkashop"
+BOT_USERNAME = "vylkashop_orders_bot"
 RENDER_URL = "https://vylkashop-orders-bot.onrender.com"
 
 BOT_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -49,7 +51,6 @@ def init_db():
             """)
 
         conn.commit()
-
         print("Database initialized successfully.")
 
     finally:
@@ -270,7 +271,8 @@ def telegram(method, data):
 def send_message(
     chat_id,
     text,
-    message_thread_id=None
+    message_thread_id=None,
+    reply_markup=None
 ):
     data = {
         "chat_id": chat_id,
@@ -280,10 +282,10 @@ def send_message(
     if message_thread_id:
         data["message_thread_id"] = message_thread_id
 
-    return telegram(
-        "sendMessage",
-        data
-    )
+    if reply_markup:
+        data["reply_markup"] = reply_markup
+
+    return telegram("sendMessage", data)
 
 
 def copy_message(
@@ -301,10 +303,7 @@ def copy_message(
     if message_thread_id:
         data["message_thread_id"] = message_thread_id
 
-    return telegram(
-        "copyMessage",
-        data
-    )
+    return telegram("copyMessage", data)
 
 
 def copy_product(
@@ -321,13 +320,69 @@ def copy_product(
 
 
 # =========================================================
-# СТВОРЕННЯ ГІЛКИ ПОКУПЦЯ
+# ПУБЛІКАЦІЯ ТОВАРУ
+# =========================================================
+
+def publish_product(source_chat_id, source_message_id):
+    """
+    Копіюємо повідомлення адміністратора в канал.
+    Потім отримуємо message_id нового поста і додаємо
+    правильну кнопку Замовити.
+    """
+
+    result = copy_message(
+        SHOP_CHANNEL,
+        source_chat_id,
+        source_message_id
+    )
+
+    if not result.get("ok"):
+        return result
+
+    post_id = result["result"]["message_id"]
+
+    product_link = (
+        f"https://t.me/{BOT_USERNAME}"
+        f"?start=post_{post_id}"
+    )
+
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "🛒 Запитати / Замовити",
+                    "url": product_link
+                }
+            ]
+        ]
+    }
+
+    keyboard_result = telegram(
+        "editMessageReplyMarkup",
+        {
+            "chat_id": SHOP_CHANNEL,
+            "message_id": post_id,
+            "reply_markup": keyboard
+        }
+    )
+
+    if not keyboard_result.get("ok"):
+        return keyboard_result
+
+    return {
+        "ok": True,
+        "post_id": post_id,
+        "product_link": product_link
+    }
+
+
+# =========================================================
+# ГІЛКА ПОКУПЦЯ
 # =========================================================
 
 def create_customer_topic(customer_id, customer_name):
     customer = get_customer(customer_id)
 
-    # Якщо гілка вже існує в базі — використовуємо її
     if customer and customer["topic_id"]:
         return customer["topic_id"]
 
@@ -360,17 +415,23 @@ def create_customer_topic(customer_id, customer_name):
 
 
 # =========================================================
-# ГОЛОВНА СТОРІНКА
+# СТАН ПУБЛІКАЦІЇ АДМІНІСТРАТОРА
+# =========================================================
+
+# Нам потрібен лише короткий стан:
+# після /publish наступне повідомлення адміністратора
+# вважаємо товаром.
+admin_publish_mode = set()
+
+
+# =========================================================
+# ROUTES
 # =========================================================
 
 @app.route("/", methods=["GET"])
 def home():
     return "VYLKA.SHOP bot is running", 200
 
-
-# =========================================================
-# WEBHOOK SETUP
-# =========================================================
 
 @app.route("/setup-webhook", methods=["GET"])
 def setup_webhook():
@@ -406,7 +467,6 @@ def webhook():
 
     sender = message.get("from", {})
 
-    # Не обробляємо повідомлення самого бота
     if sender.get("is_bot"):
         return "OK", 200
 
@@ -435,7 +495,7 @@ def webhook():
 
 
     # =====================================================
-    # ПРИВАТНИЙ ЧАТ ПОКУПЦЯ
+    # ПРИВАТНИЙ ЧАТ
     # =====================================================
 
     if chat_type == "private":
@@ -455,7 +515,91 @@ def webhook():
 
 
         # =================================================
-        # /start
+        # РЕЖИМ ПУБЛІКАЦІЇ — ТІЛЬКИ АДМІН
+        # =================================================
+
+        if customer_id == ADMIN_USER_ID:
+
+            if text == "/cancel":
+                admin_publish_mode.discard(
+                    customer_id
+                )
+
+                send_message(
+                    customer_id,
+                    "❌ Публікацію скасовано."
+                )
+
+                return "OK", 200
+
+
+            if text == "/publish":
+                admin_publish_mode.add(
+                    customer_id
+                )
+
+                send_message(
+                    customer_id,
+                    "📦 Режим публікації товару.\n\n"
+                    "Тепер надішліть ОДНЕ повідомлення "
+                    "з товаром.\n\n"
+                    "Це може бути:\n"
+                    "• фото + опис;\n"
+                    "• відео + опис;\n"
+                    "• або текстовий пост.\n\n"
+                    "Бот опублікує його у VYLKA.SHOP "
+                    "і автоматично додасть кнопку "
+                    "«🛒 Запитати / Замовити».\n\n"
+                    "Для скасування: /cancel"
+                )
+
+                return "OK", 200
+
+
+            if customer_id in admin_publish_mode:
+                # Прибираємо режим ДО публікації,
+                # щоб випадково не створити дубль.
+                admin_publish_mode.discard(
+                    customer_id
+                )
+
+                result = publish_product(
+                    customer_id,
+                    message["message_id"]
+                )
+
+                if result.get("ok"):
+                    post_id = result["post_id"]
+
+                    send_message(
+                        customer_id,
+                        "✅ Товар успішно опубліковано!\n\n"
+                        f"Номер поста: {post_id}\n"
+                        "Кнопку «🛒 Запитати / Замовити» "
+                        "додано автоматично."
+                    )
+
+                else:
+                    error_text = result.get(
+                        "description",
+                        result.get(
+                            "error",
+                            "Невідома помилка"
+                        )
+                    )
+
+                    send_message(
+                        customer_id,
+                        "⚠️ Не вдалося опублікувати товар.\n\n"
+                        f"Помилка: {error_text}\n\n"
+                        "Спробуйте /publish ще раз."
+                    )
+
+                return "OK", 200
+
+
+        # =================================================
+        # START ПОКУПЦЯ
         # =================================================
 
         if text.startswith("/start"):
@@ -478,7 +622,6 @@ def webhook():
                         post_id = None
 
                     if post_id:
-                        # Постійно зберігаємо вибраний товар
                         save_selected_product(
                             customer_id,
                             customer_name,
@@ -522,8 +665,6 @@ def webhook():
         # ПОВІДОМЛЕННЯ ПОКУПЦЯ
         # =================================================
 
-        # Якщо покупець написав без вибору товару,
-        # усе одно створюємо/оновлюємо його запис
         ensure_customer(
             customer_id,
             customer_name
@@ -554,15 +695,13 @@ def webhook():
 
             return "OK", 200
 
-
-        # Перечитуємо запис після створення topic
         customer = get_customer(
             customer_id
         )
 
 
         # =================================================
-        # ПОКАЗУЄМО ТОВАР МЕНЕДЖЕРУ
+        # НОВИЙ ТОВАР У ГІЛЦІ
         # =================================================
 
         if not customer["product_sent"]:
@@ -591,7 +730,7 @@ def webhook():
 
 
         # =================================================
-        # ПОВІДОМЛЕННЯ ПОКУПЦЯ → ГІЛКА
+        # ПОКУПЕЦЬ → МЕНЕДЖЕР
         # =================================================
 
         copy_result = copy_message(
@@ -617,7 +756,7 @@ def webhook():
 
 
     # =====================================================
-    # ГРУПА МЕНЕДЖЕРІВ
+    # ГРУПА МЕНЕДЖЕРІВ → ПОКУПЕЦЬ
     # =====================================================
 
     if str(chat_id) == str(MANAGER_CHAT_ID):
@@ -628,8 +767,6 @@ def webhook():
         if not topic_id:
             return "OK", 200
 
-        # Тепер шукаємо покупця НЕ в пам'яті Render,
-        # а безпосередньо в Neon
         customer = get_customer_by_topic(
             topic_id
         )
@@ -665,7 +802,7 @@ def webhook():
 
 
 # =========================================================
-# ІНІЦІАЛІЗАЦІЯ БАЗИ
+# DATABASE STARTUP
 # =========================================================
 
 try:
@@ -679,7 +816,7 @@ except Exception as error:
 
 
 # =========================================================
-# ЛОКАЛЬНИЙ ЗАПУСК
+# LOCAL START
 # =========================================================
 
 if __name__ == "__main__":
