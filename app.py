@@ -4,22 +4,46 @@ from flask import Flask, request
 
 app = Flask(__name__)
 
+# =========================================================
+# НАЛАШТУВАННЯ
+# =========================================================
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-MANAGER_CHAT_ID = os.environ["MANAGER_CHAT_ID"]
 
-BOT_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+# Поки ID групи невідомий, ця змінна може бути порожньою.
+MANAGER_CHAT_ID = os.environ.get("MANAGER_CHAT_ID", "")
 
-# Канал, з якого копіюємо товарні пости
+# Канал магазину
 SHOP_CHANNEL = "@vylkashop"
 
-# Тут запам'ятовуємо, який товар вибрав покупець.
-# Для першої версії достатньо; пізніше зробимо постійне зберігання.
+# Telegram Bot API
+BOT_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+# Запам'ятовуємо, який товар обрав кожен покупець.
+# Пізніше за потреби замінимо це на постійне сховище.
 customer_products = {}
 
 
+# =========================================================
+# ФУНКЦІЇ TELEGRAM
+# =========================================================
+
 def telegram(method, data):
-    response = requests.post(f"{BOT_API}/{method}", json=data, timeout=20)
-    return response.json()
+    try:
+        response = requests.post(
+            f"{BOT_API}/{method}",
+            json=data,
+            timeout=20
+        )
+
+        result = response.json()
+        print(f"Telegram {method}: {result}")
+
+        return result
+
+    except Exception as error:
+        print(f"Telegram API error: {error}")
+        return {"ok": False, "error": str(error)}
 
 
 def send_message(chat_id, text, reply_markup=None):
@@ -35,6 +59,11 @@ def send_message(chat_id, text, reply_markup=None):
 
 
 def copy_product(to_chat_id, message_id):
+    """
+    Копіює оригінальний товарний пост із каналу VYLKA.SHOP.
+    Фото/відео та підпис поста мають копіюватися разом.
+    """
+
     return telegram(
         "copyMessage",
         {
@@ -45,76 +74,148 @@ def copy_product(to_chat_id, message_id):
     )
 
 
+# =========================================================
+# ГОЛОВНА СТОРІНКА RENDER
+# =========================================================
+
 @app.route("/", methods=["GET"])
 def home():
     return "VYLKA.SHOP bot is running", 200
 
 
+# =========================================================
+# TELEGRAM WEBHOOK
+# =========================================================
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
+
     update = request.get_json(silent=True) or {}
+
+    print("UPDATE:", update)
 
     message = update.get("message")
 
+    # Поки обробляємо звичайні повідомлення.
     if not message:
         return "OK", 200
 
     chat = message.get("chat", {})
+
     chat_id = chat.get("id")
+    chat_type = chat.get("type")
 
     if not chat_id:
         return "OK", 200
 
     text = message.get("text", "")
 
-    # ---------------------------
-    # ПОКУПЕЦЬ
-    # ---------------------------
-    if chat.get("type") == "private":
 
+    # =====================================================
+    # КОМАНДА /chatid
+    # =====================================================
+
+    if text.startswith("/chatid"):
+
+        send_message(
+            chat_id,
+            f"ID цього чату:\n{chat_id}"
+        )
+
+        return "OK", 200
+
+
+    # =====================================================
+    # ПОВІДОМЛЕННЯ ВІД ПОКУПЦЯ
+    # =====================================================
+
+    if chat_type == "private":
+
+        # -------------------------------------------------
+        # ПОКУПЕЦЬ ПЕРЕЙШОВ ІЗ КНОПКИ ТОВАРУ
+        #
         # Приклад:
-        # https://t.me/vylkashop_orders_bot?start=post_7
+        # t.me/vylkashop_orders_bot?start=post_7
+        #
+        # Telegram передасть:
+        # /start post_7
+        # -------------------------------------------------
 
         if text.startswith("/start"):
 
             parts = text.split(maxsplit=1)
 
-            if len(parts) == 2 and parts[1].startswith("post_"):
+            # Якщо є параметр після /start
+            if len(parts) == 2:
 
-                try:
-                    post_id = int(parts[1].replace("post_", "", 1))
-                except ValueError:
-                    post_id = None
+                parameter = parts[1]
 
-                if post_id:
+                if parameter.startswith("post_"):
 
-                    customer_products[chat_id] = post_id
+                    try:
+                        post_id = int(
+                            parameter.replace("post_", "", 1)
+                        )
 
-                    # Показуємо покупцю сам товар
-                    copy_product(chat_id, post_id)
+                    except ValueError:
+                        post_id = None
 
-                    send_message(
-                        chat_id,
-                        "👋 Ви обрали цей товар.\n\n"
-                        "Напишіть ваше запитання або повідомлення для менеджера."
-                    )
+                    if post_id:
 
-                    return "OK", 200
+                        # Запам'ятовуємо товар цього покупця
+                        customer_products[chat_id] = post_id
 
+                        # Копіюємо сам товар покупцеві
+                        copy_result = copy_product(
+                            chat_id,
+                            post_id
+                        )
+
+                        if copy_result.get("ok"):
+
+                            send_message(
+                                chat_id,
+                                "👋 Ви обрали цей товар.\n\n"
+                                "Напишіть ваше запитання або "
+                                "повідомлення для менеджера."
+                            )
+
+                        else:
+
+                            send_message(
+                                chat_id,
+                                "Не вдалося показати товар.\n"
+                                "Будь ласка, напишіть менеджеру."
+                            )
+
+                        return "OK", 200
+
+
+            # Якщо покупець просто запустив бота
             send_message(
                 chat_id,
                 "👋 Вітаємо у VYLKA.SHOP!\n\n"
-                "Оберіть товар у нашому каналі та натисніть "
-                "«Запитати / Замовити»."
+                "Оберіть потрібний товар у нашому "
+                "Telegram-каналі та натисніть кнопку "
+                "«🛒 Запитати / Замовити»."
             )
 
             return "OK", 200
 
-        # Звичайне повідомлення покупця
+
+        # -------------------------------------------------
+        # ПОКУПЕЦЬ НАПИСАВ МЕНЕДЖЕРУ
+        # -------------------------------------------------
+
         post_id = customer_products.get(chat_id)
 
         user = message.get("from", {})
-        first_name = user.get("first_name", "Покупець")
+
+        first_name = user.get(
+            "first_name",
+            "Покупець"
+        )
+
         username = user.get("username")
 
         customer_name = first_name
@@ -122,46 +223,99 @@ def webhook():
         if username:
             customer_name += f" (@{username})"
 
-        # Спочатку менеджеру показуємо товар
-        if post_id:
-            copy_product(MANAGER_CHAT_ID, post_id)
 
-        # Потім повідомлення покупця
+        # Якщо група менеджерів ще не налаштована
+        if not MANAGER_CHAT_ID:
+
+            send_message(
+                chat_id,
+                "Дякуємо за повідомлення.\n"
+                "Система зв'язку з менеджером "
+                "зараз налаштовується."
+            )
+
+            return "OK", 200
+
+
+        # -------------------------------------------------
+        # ПОКАЗУЄМО МЕНЕДЖЕРУ ТОВАР
+        # -------------------------------------------------
+
+        if post_id:
+
+            copy_product(
+                MANAGER_CHAT_ID,
+                post_id
+            )
+
+
+        # -------------------------------------------------
+        # ФОРМУЄМО ПОВІДОМЛЕННЯ МЕНЕДЖЕРУ
+        # -------------------------------------------------
+
         manager_text = (
+            "🛍 НОВЕ ЗВЕРНЕННЯ\n\n"
             f"👤 Покупець: {customer_name}\n"
-            f"🆔 ID: {chat_id}\n"
+            f"🆔 Telegram ID: {chat_id}\n"
         )
 
         if post_id:
-            manager_text += f"📦 Пост товару: #{post_id}\n"
 
-        manager_text += "\n💬 Повідомлення:\n"
+            manager_text += (
+                f"📦 Товар: пост №{post_id}\n"
+            )
+
+        manager_text += "\n💬 Повідомлення покупця:\n"
 
         if text:
-            manager_text += text
-        else:
-            manager_text += "[медіа або інший тип повідомлення]"
 
+            manager_text += text
+
+        else:
+
+            manager_text += (
+                "[Покупець надіслав медіа "
+                "або інший тип повідомлення]"
+            )
+
+
+        # Надсилаємо менеджеру
         send_message(
             MANAGER_CHAT_ID,
-            manager_text,
-            {
-                "inline_keyboard": [
-                    [
-                        {
-                            "text": "✍️ Відповісти покупцю",
-                            "callback_data": f"reply_{chat_id}"
-                        }
-                    ]
-                ]
-            }
+            manager_text
+        )
+
+
+        # Підтвердження покупцеві
+        send_message(
+            chat_id,
+            "✅ Ваше повідомлення передано менеджеру."
         )
 
         return "OK", 200
 
+
+    # =====================================================
+    # ІНШІ ПОВІДОМЛЕННЯ
+    # =====================================================
+
     return "OK", 200
 
 
+# =========================================================
+# ЗАПУСК
+# =========================================================
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            10000
+        )
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
